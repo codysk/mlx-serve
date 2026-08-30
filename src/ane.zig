@@ -176,6 +176,14 @@ pub fn defaultShare(mode: Mode, chip: []const u8) f32 {
 pub fn defaultShareFor(mode: Mode, chip: []const u8, dual: bool) f32 {
     if (mode == .row) return 0.40;
     if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return if (dual) 0.50 else 0.35;
+    // M4 Pro (2026-08-27, 48 GB, Qwen3.8-27B-MLX-Serve-4bit dense, 13.4k-token
+    // prompts, 3 reps per arm, off-bracketed 127.5-127.9 tok/s): 0.35/0.40/0.45/
+    // 0.50/0.55/0.60 ranked 162.5/172.7/178.0/192.9/200.6/215.1 tok/s prefill —
+    // NO rollover through 0.60 on this die (a 20-core GPU hides less of the MLP
+    // than Max's 32-40, so the ANE stays off the critical path at shares where
+    // Max already regresses), but 0.65+ collapses the auto-context pin below the
+    // 13.4k probe on a 48 GB box; 0.55 keeps a notch of that headroom.
+    if (std.mem.indexOf(u8, chip, "M4 Pro") != null) return 0.55;
     return 0.45;
 }
 
@@ -1031,6 +1039,11 @@ test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
     try std.testing.expect(!dualEnabledFrom(null, "Apple M4 Max"));
     try std.testing.expect(dualEnabledFrom("1", "Apple M4 Max"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M4 Max"));
+    // M4 Pro (2026-08-27, 48 GB, Qwen3.8-27B-MLX-Serve-4bit dense, 13.4k-token
+    // prompts, 3 reps per arm, off-bracketed 127.5-127.9 tok/s): 0.35/0.40/0.45/
+    // 0.50/0.55/0.60 ranked 162.5/172.7/178.0/192.9/200.6/215.1 — no rollover
+    // through 0.60, but 0.65+ collapses the auto-context pin below 13.4k.
+    try std.testing.expectEqual(@as(f32, 0.55), defaultShare(.channel, "Apple M4 Pro"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M3 Max"));
     try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, ""));
     // Row mode is only measured on M4; every chip keeps that row.
