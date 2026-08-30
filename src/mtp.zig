@@ -88,6 +88,13 @@ pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
         std.mem.indexOf(u8, chip, "M4 Max") == null and
         std.mem.indexOf(u8, chip, "M4 Ultra") == null) return .{ .cap = 4, .label = "m4-base", .measured = true };
     if (std.mem.indexOf(u8, chip, "M4 Max") != null) return .{ .cap = default_cap, .label = "m4-max", .measured = true };
+    // M4 Pro (2026-08-27, Qwen3.8-27B-OrcaRouter 6-bit qwen3_5_moe, 48 GB,
+    // llmprobe context ladder, two passes per arm): cap 6 loses the deep rung
+    // twice — 11.3/11.9 vs cap 5's 12.1/12.2 tok/s at 16.3k — while every
+    // short rung sits inside noise (13.7/13.6 vs 13.5/13.6 at ~4.3k). A far
+    // milder cliff than base M4's 17%: only the deepest bucket pays the wide
+    // extension syncs, so the cap binds there and nowhere else.
+    if (std.mem.indexOf(u8, chip, "M4 Pro") != null) return .{ .cap = 5, .label = "m4-pro", .measured = true };
     // Base M5 only — the Pro/Max/Ultra dies are their own (unmeasured) rows.
     if (std.mem.indexOf(u8, chip, "M5") != null and
         std.mem.indexOf(u8, chip, "M5 Pro") == null and
@@ -4492,16 +4499,21 @@ test "adaptiveDepthCapForMachine names the row it applied" {
     try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("", 6).label);
 }
 
-test "base M4 caps at 4 where M4 Pro/Max keep the default (2026-08-22 sweep)" {
+test "base M4 caps at 4, M4 Pro at 5, Max keeps the default (2026-08-27 sweeps)" {
     // Depth 4 is the only width where the cap BINDS, collapsing the plan to
     // one chunk; from 5 on every round pays an extension sync for ~1 more
     // accepted token and loses 17%. The probe's cost cliff says 6 here.
     try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M4", 6).cap);
     try testing.expectEqualStrings("m4-base", adaptiveDepthCapForMachine("Apple M4", 6).label);
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Pro", 6).cap);
+    // M4 Pro (2026-08-27, Qwen3.8-27B-OrcaRouter 6-bit qwen3_5_moe, 48 GB,
+    // llmprobe context ladder, two passes per arm): cap 6 loses the deep
+    // rung twice — 11.3/11.9 vs cap 5's 12.1/12.2 tok/s at 16.3k — while the
+    // short rungs sit inside noise (13.7/13.6 vs 13.5/13.6 at ~4.3k).
+    try testing.expectEqual(@as(u32, 5), adaptiveDepthCapForMachine("Apple M4 Pro", 6).cap);
+    try testing.expectEqualStrings("m4-pro", adaptiveDepthCapForMachine("Apple M4 Pro", 6).label);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
     // Every row above is a HUMAN sweep and outranks the boot probe.
-    for ([_][]const u8{ "Apple M4", "Apple M4 Max", "Apple M1 Pro", "Apple M5" }) |c| {
+    for ([_][]const u8{ "Apple M4", "Apple M4 Pro", "Apple M4 Max", "Apple M1 Pro", "Apple M5" }) |c| {
         try testing.expect(adaptiveDepthCapForMachine(c, 6).measured);
     }
     try testing.expect(!adaptiveDepthCapForMachine("Apple M2 Pro", 6).measured);
