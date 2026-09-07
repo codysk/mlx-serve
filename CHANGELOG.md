@@ -4,6 +4,8 @@
 
 ### Highlights
 
+- **Per-model context, KV cache and MTP settings.** Right-click a model in My Models > Model Settings to give it its own context size, KV quant (off / 4-bit / 8-bit) and MTP default; they apply whenever that model loads and a resident model is reloaded on the spot, no server restart. Headless: `~/.mlx-serve/model-settings.json`, keyed by model path; `/v1/models` reports `meta.kv_quant`. `/v1/unload-model` now accepts an absolute path for `org/name` models.
+
 - **Add other chat endpoints as providers.** Settings > Providers takes any OpenAI-compatible `/v1/chat/completions` server (a cloud API, another machine, a local runtime) with a key or an env var name; its models join the picker as `<model>@<name>` while it answers, and a provider without a model list can declare its models. Headless: `~/.mlx-serve/providers.json`, `GET /v1/providers`, `POST /v1/providers/reload`. Chat completions only for now; provider models are never shared over the LAN.
 
 - **Speculative decoding on Flash Next got cheaper per round.** The speculation step used to stall: the model's n-gram lookup needs its draft tokens on the CPU, so the rest of the 48-layer graph waited for the whole draft chain to finish on the GPU before it was even built. It is now built while the drafts are still running, and the draft head only projects the row it actually uses. Code prompts go 111 -> 117 tok/s and prose 56 -> 59 on an M5 Max at a fixed draft depth, with byte-identical output.
@@ -19,6 +21,7 @@
 
 ### Fixes
 
+- A batch sweep no longer evicts your conversation from the prefix cache. Cache entries are grouped by workload (`prompt_cache_key`, else `metadata.user_id`, else the system prompt) and eviction takes the oldest entry of the largest group, so a sweep of documents evicts its own documents and a warm conversation stays warm. One workload alone behaves exactly as before. (#378)
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
 - More of the same class: an out-of-memory while growing the attention cache, or inside a speculative round, could free a buffer twice or free memory that was never built, taking the server down instead of failing one request. Latent until #353 made these paths reachable.
 - Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.
