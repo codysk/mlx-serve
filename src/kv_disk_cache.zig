@@ -69,6 +69,12 @@ pub const MIN_PERSIST_TOKENS: u32 = 512;
 
 pub const DEFAULT_CHUNK_TOKENS: u32 = 1024;
 
+/// Budget floor for a decline-spill's flush: the client is already gone, so
+/// the only cost is the synchronous write itself (~2-4 s at SSD speeds); the
+/// tier's byte budget and LRU eviction are the real bounds. Sized to bank a
+/// 122k-token hybrid candidate's KV in one spill.
+pub const DECLINE_SPILL_FLUSH_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Max persisted SSM checkpoint positions per entry. Every turn adds an
 /// end-of-prompt checkpoint; unbounded, one long session would accumulate GBs in a single
 /// entry. Thinning is span-preserving (`transformer.positionDropIndex`): the lowest and the
@@ -262,6 +268,10 @@ pub const Match = struct {
     /// actually rebuild.
     usable: u32,
 };
+
+/// `bestHybridMatch`'s result: the winning entry, its usable prefix, and the
+/// restorable checkpoint position (≤ usable) that won it the race.
+pub const HybridMatch = struct { idx: usize, usable: u32, cp: u32 };
 
 fn nbytesOf(a: mlx.mlx_array) u64 {
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
@@ -627,6 +637,33 @@ pub const DiskTier = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .usable = best_usable };
         return null;
+    }
+
+    /// Hybrid targets rank disk entries by their RESTORABLE position — the
+    /// highest SSM checkpoint at or below the usable prefix — not by the raw
+    /// usable length (the RAM tier's #312 lesson: a longer raw match whose
+    /// checkpoints sit past the divergence restores nothing, and must not
+    /// shadow a shorter entry with a higher restorable position). Entries
+    /// with no checkpoint at or below their usable prefix are skipped.
+    pub fn bestHybridMatch(
+        self: *const DiskTier,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        limit: u32,
+    ) ?HybridMatch {
+        var best: ?HybridMatch = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, quant)) continue;
+            const max_shared = @min(e.tokens.len, prompt_ids.len);
+            var shared: usize = 0;
+            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
+            const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
+            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse continue;
+            if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
+        }
+        return best;
     }
 
     /// Rebuild the persisted KV state of `entries[idx]` into `cache`:

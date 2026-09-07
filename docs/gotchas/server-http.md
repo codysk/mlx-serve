@@ -1957,3 +1957,28 @@ prefix from SSD`, `chunk-heavy hybrid flush still lands its SSM
 checkpoints`, `a budget-declined candidate spills to the SSD tier` (all
 in prefix_cache.zig), plus the decline-reason log lines the next live
 post-mortem will need.
+
+## The restore ceiling that would not climb (flush pace + wrong ranking, 2026-09-07)
+
+With the decline/spill/restore chain live, a 122k retry loop still restored
+the same 51200 tokens every time. Two causes:
+
+1. Flush pace: the decline-spill inherited `max_flush_bytes` (512 MB ≈
+   13k tokens), so each retry banked 13k of the ~48k tokens it had just
+   computed — the growing entry needed ~8 retries to pass the old entry's
+   51200 restore point. The cap prices the stall a LIVE next request
+   pays after a response; a decline-spill runs on a request whose client
+   is already gone. `spillDeclinedToDisk` now floors its flush budget at
+   4 GB (the tier's byte budget + LRU is the real bound) — one spill
+   banks a full 122k-token hybrid candidate.
+2. Ranking: the disk hybrid arm picked its entry by raw usable length
+   (`bestMatch`) and then took THAT entry's checkpoint — the RAM tier's
+   #312 lesson, unlearned on the disk side. The moment the growing
+   conversation entry's usable length passed the old entry's, it would
+   have shadowed cp@51200 with cp@49152 and REGRESSED the restore.
+   `bestHybridMatch` ranks by the highest checkpoint at or below the
+   usable prefix.
+
+Guards: `a decline-spill is not bounded by the per-flush byte cap` and
+`hybrid disk restore ranks entries by restorable checkpoint, not raw
+length` (prefix_cache.zig).

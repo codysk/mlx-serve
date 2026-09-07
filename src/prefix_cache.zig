@@ -1051,16 +1051,21 @@ pub const HotPrefixCache = struct {
                 // Hybrid: compare EFFECTIVE restorable positions — the largest
                 // SSM checkpoint ≤ the match on each tier, not the raw prefix
                 // length (KV alone is useless without matching SSM state).
+                // The disk side ranks entries by that checkpoint too (#312's
+                // RAM lesson: a longer raw match whose checkpoints sit past
+                // the divergence restores nothing — and it must not shadow a
+                // shorter entry with a higher restorable position).
                 const ram_eff: usize = if (match) |m| blk: {
                     const e = &self.entries.items[m.idx];
                     const cps = e.ssm_checkpoints orelse break :blk 0;
                     const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
                     break :blk cp.pos;
                 } else 0;
-                const disk_cp = d.highestSsmPosAtOrBelow(dm.idx, usable) orelse break :disk;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, disk_limit) orelse break :disk;
+                const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
-                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, dm.idx, disk_cp, s) catch |err| {
+                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
                     log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
                     // A failed restore can leave the cache AND ssm entries
                     // half-rebuilt; reset both before the fall-through.
@@ -1830,6 +1835,15 @@ pub const HotPrefixCache = struct {
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         if (tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+        // A decline-spill runs after the client is gone: the per-flush cap
+        // exists to bound the stall a LIVE next request pays, and capping
+        // here stranded most of each retry's work (live 2026-09-07: 512 MB
+        // ≈ 13k tokens banked per retry while ~35k were recomputed every
+        // time). Raise the budget for the spill's duration — the tier's
+        // byte budget + LRU eviction is the real bound.
+        const saved_cap = d.max_flush_bytes;
+        d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
+        defer d.max_flush_bytes = saved_cap;
         const outcome = d.appendCommit(snap.entries, snap.step, snap.config, tokens, has_tools, cps, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
@@ -3712,6 +3726,123 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
         const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, 0, null, null);
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
+    }
+}
+
+test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" {
+    // The per-flush cap bounds the stall a LIVE next request pays after a
+    // response. A decline-spill runs on a request whose client is already
+    // gone — capping it (live 2026-09-07: 512 MB ≈ 13k tokens banked per
+    // retry) stranded most of each retry's work while ~35k tokens were
+    // recomputed every time. The spill owes no latency; the tier's byte
+    // budget + LRU is the real bound.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 16 * 1024);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-cap", 0, 128);
+        defer hc.deinit();
+        // A cap of two KV chunks — the exact starvation shape, scaled down.
+        hc.disk.?.max_flush_bytes = 2 * 128 * 2 * 2 * 8 * 4;
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        const st = try hc.commit(&cache, &tokens, false);
+        try testing.expect(st == .declined);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // The WHOLE candidate must be restorable, not just the cap's worth.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-cap", 0, 128);
+        defer hc2.deinit();
+        var cache2 = try KVCache.init(testing.allocator, 2);
+        defer cache2.deinit();
+        var moe: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, 0, null, null);
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+    }
+}
+
+test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint, not raw length" {
+    // The RAM tier learned this the hard way (#312): a longer raw match
+    // whose checkpoints sit past the divergence restores nothing. The disk
+    // tier's hybrid arm used bestMatch (ranked by usable length) and then
+    // took that ONE entry's checkpoint — an entry with a high usable length
+    // but low checkpoints shadowed a shorter entry with a higher
+    // restorable position (live 2026-09-07: the growing conversation entry
+    // would have shadowed the old entry's cp@51200 with cp@49152).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Entry A: shares 550 tokens with the prompt (longer) but its only
+    // checkpoint is at 256. Diverges from the prompt at 550.
+    var a_tokens: [600]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = if (i < 550) @intCast(i + 7) else @intCast(i + 700);
+    // Entry B: shares only 512 tokens (shorter) but carries a checkpoint
+    // at 512. Diverges from the prompt at 512 — so neither entry is a
+    // prefix of the other and the flush cannot merge them.
+    var b_tokens: [520]u32 = undefined;
+    for (&b_tokens, 0..) |*t, i| t.* = if (i < 512) @intCast(i + 7) else @intCast(i + 900);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-rank", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+        var src = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src);
+        const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
+        _ = try hc.commitWithSsm(&cache, &a_tokens, false, cps_a, null, null);
+        hc.flushPendingDisk(s);
+        var cache_b = try KVCache.init(testing.allocator, 3);
+        defer cache_b.deinit();
+        try testFillCache(&cache_b, s, 3, 600);
+        const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        _ = try hc.commitWithSsm(&cache_b, &b_tokens, false, cps_b, null, null);
+        hc.flushPendingDisk(s);
+    }
+
+    // RAM empty; the hybrid lookup must restore from B's cp@512, not A's
+    // cp@256 — even though A's raw usable length (600) beats B's (512).
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-rank", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 2), hc2.disk.?.entryCount());
+
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var ssm2 = pcEmptySsm();
+        defer pcFreeHybrid(&ssm2);
+        var moe_off: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
+        try testing.expect(!res.full_match);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expectEqual(@as(usize, 512), cache2.step);
     }
 }
 
