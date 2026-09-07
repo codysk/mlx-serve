@@ -1085,7 +1085,7 @@ pub const DiskTier = struct {
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
-                        if (!self.ssmWorkPending(e, ssm_checkpoints, e.kv_len) and
+                        if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
                             !specWorkPending(e, dflash_snap, mtp_snap))
                         {
                             // Superseded: the tier already holds this prefix in full.
@@ -1154,7 +1154,29 @@ pub const DiskTier = struct {
             if (chunk_sizes.items.len > keep) chunk_sizes.shrinkRetainingCapacity(keep);
         }
 
+        // Phase 3 FIRST: checkpoints come off the TOP of the flush budget —
+        // chunk-first budgeting starved them to ZERO on turns appending ≥
+        // the cap in chunks (live 2026-09-07: cancel-salvage retries at
+        // +16 chunks ≈ 544 MB vs a 512 MB cap left no checkpoint budget,
+        // ever; every entry of the Sep-4 disk wave landed KV-only and
+        // unrestorable). Their share is capped at half the budget so chunk
+        // progress never stalls entirely. The eligibility bound is the
+        // TARGET length, not the chunk progress: a checkpoint beyond the
+        // chunks this flush reaches is still written (position-keyed,
+        // immutable) and becomes restorable when a later flush extends
+        // kv_len past it.
+        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
+        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
         var written_bytes: u64 = 0;
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
+            chunk_sizes.deinit(self.allocator);
+            return err;
+        };
+        errdefer ssm_res.deinit(self.allocator);
+
+        // Chunks [0, keep) are full chunks already on disk (see above); the
+        // rewrite runs from `keep` up to the REMAINDER of the flush bound —
+        // the checkpoints above already came off the top of it.
         var chunk_i: u32 = keep;
         while (chunk_i < n_chunks) : (chunk_i += 1) {
             if (written_bytes >= flush_bound and chunk_i > keep) break;
@@ -1167,23 +1189,12 @@ pub const DiskTier = struct {
         const chunks_done: u32 = chunk_i;
         const chunk_complete = chunks_done == n_chunks;
         const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
-        if (kv_len <= old_kv) {
-            // Cap so tight nothing new landed.
+        if (kv_len <= old_kv and ssm_res.positions.len == old_ssm_pos.len) {
+            // Cap so tight nothing new landed — nothing to commit (a
+            // checkpoint-only write still counts as progress).
             chunk_sizes.deinit(self.allocator);
             return if (chunk_complete) .persisted else .partial;
         }
-
-        // Phase 3: persist any SSM checkpoints whose position is within the KV
-        // now on disk (a hybrid restore needs KV covering [0, cp_pos), so a
-        // checkpoint beyond the partially-flushed KV waits for a later turn).
-        // Shares the per-flush byte budget with the chunk writes above.
-        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
-        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_len, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s) catch |err| {
-            chunk_sizes.deinit(self.allocator);
-            return err;
-        };
-        errdefer ssm_res.deinit(self.allocator);
         const complete = chunk_complete and ssm_res.complete;
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
@@ -1349,7 +1360,10 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_rel);
         const e = &self.entries.items[idx];
         var written_bytes: u64 = 0;
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s);
+        // Write-ahead bound: the token record, not the flushed kv_len — a
+        // checkpoint beyond the current chunks is position-keyed and becomes
+        // restorable when a later extend raises kv_len past it.
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
         errdefer ssm_res.deinit(self.allocator);
 
         // Captured before the sidecar write overwrites it: this path bills a delta.
@@ -1896,21 +1910,28 @@ pub const DiskTier = struct {
     }
 
     /// Persist the eligible SSM checkpoints for one entry: write target
-    /// positions not yet on disk (highest-first — the end-of-prompt checkpoint
-    /// is the most valuable, so it survives a tight per-flush cap), delete
-    /// retention-dropped positions, and return the resulting on-disk set.
-    /// `written_bytes` accumulates across the chunk writes so checkpoint bytes
-    /// count toward the same per-flush budget.
+    /// positions not yet on disk (highest-first — the end-of-prompt
+    /// checkpoint is the most valuable), delete retention-dropped
+    /// positions, and return the resulting on-disk set. `written_bytes`
+    /// accumulates the bytes this call wrote; `max_spend` is this call's
+    /// own byte share of the flush budget (the caller decides how much of
+    /// `max_flush_bytes` the checkpoints get — chunk-first budgeting
+    /// starved them to zero on chunk-heavy turns, live 2026-09-07).
+    /// `kv_limit` is the WRITE-AHEAD bound, not the flushed kv_len: a
+    /// checkpoint beyond the chunks this flush reaches is still written
+    /// (position-keyed, immutable) and becomes restorable when a later
+    /// flush extends the entry's kv_len past it.
     fn persistSsmCheckpoints(
         self: *DiskTier,
         id: u64,
         dir_rel: []const u8,
-        kv_len: u32,
+        kv_limit: u32,
         old_positions: []const u32,
         old_bytes: []const u64,
         cps_opt: ?[]const transformer_mod.SSMCheckpoint,
         written_bytes: *u64,
         s: mlx.mlx_stream,
+        max_spend: u64,
     ) !SsmPersistResult {
         const cps: []const transformer_mod.SSMCheckpoint = cps_opt orelse &[_]transformer_mod.SSMCheckpoint{};
         if (cps.len == 0 and old_positions.len == 0) {
@@ -1920,7 +1941,7 @@ pub const DiskTier = struct {
                 .complete = true,
             };
         }
-        const target = try self.ssmTargetPositions(old_positions, cps, kv_len);
+        const target = try self.ssmTargetPositions(old_positions, cps, kv_limit);
         defer self.allocator.free(target);
 
         // Delete positions retention drops (present on disk, absent from target).
@@ -1945,10 +1966,12 @@ pub const DiskTier = struct {
             const p = target[ti - 1];
             if (std.mem.indexOfScalar(u32, old_positions, p) != null) continue; // already on disk
             const cp = findCp(cps, p) orelse continue;
-            // Under SSD-first a checkpoint is written beside its chunk, outside the byte budget.
-            if (!self.ssd_first and written_bytes.* >= self.max_flush_bytes) {
+            // Under SSD-first a checkpoint is written beside its chunk, outside the byte budget;
+            // elsewhere its share of the flush budget is bounded by `max_spend` (half the cap —
+            // chunk-first budgeting starved them to zero, live 2026-09-07).
+            if (!self.ssd_first and written_bytes.* >= max_spend) {
                 complete = false;
-                continue; // budget exhausted — persist on a later flush
+                continue; // share exhausted — persist on a later flush
             }
             const sz = try self.writeSsmFile(dir_rel, cp, s);
             written_bytes.* += sz;
