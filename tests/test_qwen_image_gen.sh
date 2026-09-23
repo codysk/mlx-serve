@@ -78,8 +78,21 @@ assert m and m[0]['state'] == 'ready' and 'image' in m[0]['capabilities'], m" \
   && pass "load by path -> ready with the image capability" || fail "pack did not load as an image model"
 grep -q "\[image\] Qwen-Image-2.1 ready" "$LOG" && pass "qwen_image backend engaged" || fail "no backend ready line"
 
+# Loaded and unloaded rows must both report the pack's real model_type, never
+# the image modality's "flux2" marker (a client watching the list would see
+# the architecture flip on load).
+arch_row() { # arch_row <label>
+  curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c "
+import sys, json
+m = [x for x in json.load(sys.stdin)['data'] if x['id'] == '$ID']
+assert m and m[0].get('meta', {}).get('architecture') == 'qwen_image21', m" \
+    && pass "models row reports qwen_image21 ($1)" || fail "models row reports the flux2 modality marker ($1)"
+}
+arch_row loaded
+
 [ "$(gen "$OUT/a.json" '"prompt":"a red fox in the snow"')" = 200 ] && png_check "$OUT/a.json" \
   && pass "txt2img -> 512x512 PNG" || fail "txt2img"
+arch_row after-generate
 grep -q "one forward per step" "$LOG" && pass "guidance 1.0 runs one forward per step" || fail "no one-forward log line"
 
 if [[ "$MODEL" == *4bit* ]]; then
