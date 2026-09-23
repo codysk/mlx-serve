@@ -150,6 +150,16 @@ def run_graft(pack, src, bits_override):
         os.rename(backup, os.path.join(pack, "text_encoder"))
         raise
     shutil.rmtree(stage_root, ignore_errors=True)
+
+    # convert_component writes only the shards; text_encoder/config.json (the
+    # vision_config the Zig loader reads) must ride along — the old pack's,
+    # else the source's.
+    new_cfg = os.path.join(pack, "text_encoder", "config.json")
+    if not os.path.exists(new_cfg):
+        cfg_src = os.path.join(backup, "config.json")
+        if not os.path.exists(cfg_src):
+            cfg_src = os.path.join(src, "text_encoder", "config.json")
+        shutil.copy2(cfg_src, new_cfg)
     print(f"old text_encoder moved to: {backup}")
 
     total = sum(os.path.getsize(p) for p in glob.glob(os.path.join(pack, "text_encoder", "*.safetensors")))
@@ -204,6 +214,11 @@ def self_test():
 
         backup = run_graft(pack, src, None)
         new_shard = os.path.join(pack, "text_encoder", "model-00001-of-00001.safetensors")
+
+        # convert_component writes only the shards; the loader reads the tower
+        # geometry from text_encoder/config.json, so the rebuilt dir MUST carry
+        # it (the old pack's, else the source's).
+        assert os.path.exists(os.path.join(pack, "text_encoder", "config.json"))
 
         # 1. tower keys present, quantized triplets, pos_embed dense, lm_head dropped
         new_keys = all_pack_keys(os.path.join(pack, "text_encoder"))
