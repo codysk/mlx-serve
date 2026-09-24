@@ -232,18 +232,17 @@ for stream in false true; do
 done
 [ "$(gen "$OUT/rgb.json" '"prompt":"a red fox in the snow","transparent":false')" = 200 ] && png_check "$OUT/rgb.json" \
   && pass "transparent=false restores RGB after RGBA" || fail "explicit RGB after RGBA"
-# ── OpenAI multipart surface: the second file becomes a ref_images entry (the
-# vendor form has no steps field — the backend default applies, so the arm
-# pins an explicit small canvas to stay cheap)
+# ── OpenAI multipart surface: the second file becomes a ref_images entry; the
+# sampling knobs (steps et al) ride through the form, not silently dropped
 code="$(curl -s -m 3600 -X POST "http://127.0.0.1:$PORT/v1/images/edits" \
   -F "model=$ID" -F "prompt=compose the two pictures into one image" \
   -F "image=@$OUT/src43.png;type=image/png" \
   -F "image[]=@$OUT/refp.png;type=image/png" \
-  -F "size=256x256" -o "$OUT/mp.json" -w '%{http_code}')"
+  -F "size=256x256" -F "steps=6" -F "ref_resolution=512" -o "$OUT/mp.json" -w '%{http_code}')"
 [ "$code" = 200 ] && [ "$(png_dims "$OUT/mp.json")" = "256x256" ] \
   && pass "/v1/images/edits (multipart, 2 files) -> 256x256 PNG" || fail "multipart edit returned $code"
-grep -q "\[qwen-image\] edit 256x256 refs=2 " "$LOG" \
-  && pass "multipart edit carried both files (refs=2)" || fail "multipart edit lost a reference"
+grep -q "\[qwen-image\] edit 256x256 refs=2 steps=6 guidance=1.0 refres=512 (one forward per step)" "$LOG" \
+  && pass "multipart carried both files + the sampling knobs (refs=2 steps=6 refres=512)" || fail "multipart edit lost a reference or a knob"
 
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && pass "server alive" || fail "server died"
 grep -q "\[mlx\]" "$LOG" && fail "MLX error in the log"

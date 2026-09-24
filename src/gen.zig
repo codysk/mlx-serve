@@ -1656,6 +1656,10 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     var lora_path: ?[]const u8 = null;
     var lora_scale: ?[]const u8 = null;
     var ref_resolution: ?[]const u8 = null;
+    var steps: ?[]const u8 = null;
+    var seed: ?[]const u8 = null;
+    var guidance_scale: ?[]const u8 = null;
+    var negative_prompt: ?[]const u8 = null;
 
     while (it.next()) |part| {
         // `image`, `image[]` and `image[0]` are all in the wild.
@@ -1676,6 +1680,14 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             if (part.data.len != 0) return error.MaskUnsupported;
         } else if (std.mem.eql(u8, part.name, "ref_resolution")) {
             if (part.data.len != 0) ref_resolution = part.data;
+        } else if (std.mem.eql(u8, part.name, "steps")) {
+            if (part.data.len != 0) steps = part.data;
+        } else if (std.mem.eql(u8, part.name, "seed")) {
+            if (part.data.len != 0) seed = part.data;
+        } else if (std.mem.eql(u8, part.name, "guidance_scale")) {
+            if (part.data.len != 0) guidance_scale = part.data;
+        } else if (std.mem.eql(u8, part.name, "negative_prompt")) {
+            if (part.data.len != 0) negative_prompt = part.data;
         } else if (std.mem.eql(u8, part.name, "n")) {
             if (part.data.len != 0 and !std.mem.eql(u8, part.data, "1")) return error.MultipleChoicesUnsupported;
         } else if (std.mem.eql(u8, part.name, "response_format")) {
@@ -1751,6 +1763,24 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     if (ref_resolution) |rr| {
         try out.appendSlice(allocator, ",\"ref_resolution\":");
         try out.appendSlice(allocator, rr);
+    }
+    // Sampling knobs: raw text through — the JSON handler's own range
+    // checks are the named 400s; a malformed value fails its body parse.
+    if (steps) |v| {
+        try out.appendSlice(allocator, ",\"steps\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (seed) |v| {
+        try out.appendSlice(allocator, ",\"seed\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (guidance_scale) |v| {
+        try out.appendSlice(allocator, ",\"guidance_scale\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (negative_prompt) |v| {
+        try out.appendSlice(allocator, ",\"negative_prompt\":");
+        try chat_mod.appendJsonString(allocator, &out, v);
     }
     try out.appendSlice(allocator, "}");
     return out.toOwnedSlice(allocator);
@@ -4943,6 +4973,23 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     var p5 = try std.json.parseFromSlice(std.json.Value, a, j5, .{});
     defer p5.deinit();
     try testing.expectEqual(@as(i64, 512), p5.value.object.get("ref_resolution").?.integer);
+
+    // Sampling knobs ride through too (dropping them silently ran every
+    // multipart edit at the 40-step default).
+    const knobs = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"steps\"\r\n\r\n15\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"seed\"\r\n\r\n7\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"guidance_scale\"\r\n\r\n2.5\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"negative_prompt\"\r\n\r\nblurry\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n";
+    const j6 = try openaiEditFormToJson(a, knobs, CT);
+    defer a.free(j6);
+    var p6 = try std.json.parseFromSlice(std.json.Value, a, j6, .{});
+    defer p6.deinit();
+    try testing.expectEqual(@as(i64, 15), p6.value.object.get("steps").?.integer);
+    try testing.expectEqual(@as(i64, 7), p6.value.object.get("seed").?.integer);
+    try testing.expectEqual(@as(f64, 2.5), p6.value.object.get("guidance_scale").?.float);
+    try testing.expectEqualStrings("blurry", p6.value.object.get("negative_prompt").?.string);
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {
