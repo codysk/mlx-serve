@@ -579,6 +579,10 @@ pub const ImageGenOpts = struct {
     /// into the weights and is never asked to run it.
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
+    /// Qwen-Image edit: reference conditioning resolution — diffusers'
+    /// per-call `output_resolution` knob. [256,1024] at the wire; 1024 is
+    /// the trained regime, lower trades conditioning fidelity for speed.
+    ref_resolution: u32 = 1024,
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -784,6 +788,7 @@ pub const ImageEngine = struct {
                     break :blk q.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, .{
                         .guidance_scale = opts.guidance_scale,
                         .negative_prompt = opts.negative_prompt,
+                        .ref_resolution = opts.ref_resolution,
                     }, progress);
                 if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
@@ -1650,6 +1655,7 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     var lora_scales: ?[]const u8 = null;
     var lora_path: ?[]const u8 = null;
     var lora_scale: ?[]const u8 = null;
+    var ref_resolution: ?[]const u8 = null;
 
     while (it.next()) |part| {
         // `image`, `image[]` and `image[0]` are all in the wild.
@@ -1668,6 +1674,8 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             if (!std.mem.eql(u8, part.data, "auto") and part.data.len != 0) size = part.data;
         } else if (std.mem.eql(u8, part.name, "mask")) {
             if (part.data.len != 0) return error.MaskUnsupported;
+        } else if (std.mem.eql(u8, part.name, "ref_resolution")) {
+            if (part.data.len != 0) ref_resolution = part.data;
         } else if (std.mem.eql(u8, part.name, "n")) {
             if (part.data.len != 0 and !std.mem.eql(u8, part.data, "1")) return error.MultipleChoicesUnsupported;
         } else if (std.mem.eql(u8, part.name, "response_format")) {
@@ -1739,6 +1747,10 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             try out.appendSlice(allocator, "\"");
         }
         try out.appendSlice(allocator, "]");
+    }
+    if (ref_resolution) |rr| {
+        try out.appendSlice(allocator, ",\"ref_resolution\":");
+        try out.appendSlice(allocator, rr);
     }
     try out.appendSlice(allocator, "}");
     return out.toOwnedSlice(allocator);
@@ -2296,6 +2308,17 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (guidance_scale != 1.0 and !engine.supportsGuidance())
         return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 or Qwen-Image model");
 
+    // Qwen-Image edit: reference conditioning resolution (diffusers'
+    // per-call `output_resolution` knob). Lower = fewer joint tokens per
+    // ref at conditioning-fidelity cost; 1024 = the trained regime.
+    var ref_resolution: u32 = 1024;
+    if (extractJsonInt(body, "ref_resolution")) |rr| {
+        if (rr < 256 or rr > 1024) return sendError(conn, 400, "'ref_resolution' must be in [256,1024]");
+        if (engine.backend != .qwen_image)
+            return sendError(conn, 400, "'ref_resolution' requires a Qwen-Image model");
+        ref_resolution = @intCast(rr);
+    }
+
     // Style LoRA(s): one or more absolute paths to .safetensors adapters,
     // each with an optional scale — mirrors mflux's `--lora-paths`/
     // `--lora-scales`. Accepts the array form (`lora_paths`/`lora_scales`)
@@ -2342,6 +2365,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .cond_weights = cond_weights,
         .guidance_scale = guidance_scale,
         .negative_prompt = negative_prompt,
+        .ref_resolution = ref_resolution,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
@@ -4909,6 +4933,16 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     defer p4.deinit();
     try testing.expectEqualStrings("/l/a.safetensors", p4.value.object.get("lora_paths").?.array.items[0].string);
     try testing.expectEqual(@as(f64, 0.8), p4.value.object.get("lora_scales").?.array.items[0].float);
+
+    // ref_resolution (the qwen speed knob) rides through the form too.
+    const rr = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"ref_resolution\"\r\n\r\n512\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n";
+    const j5 = try openaiEditFormToJson(a, rr, CT);
+    defer a.free(j5);
+    var p5 = try std.json.parseFromSlice(std.json.Value, a, j5, .{});
+    defer p5.deinit();
+    try testing.expectEqual(@as(i64, 512), p5.value.object.get("ref_resolution").?.integer);
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {

@@ -1937,6 +1937,10 @@ fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
 pub const EditOpts = struct {
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
+    /// Reference conditioning resolution — diffusers' per-call
+    /// `output_resolution` knob. Lower = fewer joint tokens per ref (speed)
+    /// at conditioning-fidelity cost; 1024 is the trained regime.
+    ref_resolution: u32 = EDIT_REF_RESOLUTION,
 };
 
 /// diffusers calculate_dimensions: source aspect at output_resolution², round() each side.
@@ -1965,11 +1969,12 @@ fn snap32(x: u32) u32 {
     return @intCast(@min(@max(r, 32), cap));
 }
 
-/// A reference's resize target: its aspect at EDIT_REF_RESOLUTION², each side
-/// onto the /32 grid (gen.zig's target path snaps the same way). /32 keeps the
-/// latent and patch grids even, so 2x2 slots split exactly.
-fn refResizeDims(src_w: u32, src_h: u32) struct { w: u32, h: u32 } {
-    const t = editTargetSize(src_w, src_h, EDIT_REF_RESOLUTION);
+/// A reference's resize target: its aspect at the request's ref resolution²
+/// (`EditOpts.ref_resolution` — diffusers' `output_resolution` per-call knob),
+/// each side onto the /32 grid. /32 keeps the grid the slot math needs
+/// (smart_resize's own `max(factor, …)` floor).
+fn refResizeDimsAt(src_w: u32, src_h: u32, res: u32) struct { w: u32, h: u32 } {
+    const t = editTargetSize(src_w, src_h, res);
     return .{ .w = snap32(t.w), .h = snap32(t.h) };
 }
 
@@ -2262,8 +2267,8 @@ pub const Engine = struct {
         const n_img: c_int = @intCast(target_tokens);
         const z: c_int = @intCast(self.dit_cfg.in_ch);
 
-        log.info("[qwen-image] edit {d}x{d} refs={d} steps={d} guidance={d:.1} ({s})\n", .{
-            out_w,                      out_h,  image_bytes.len, n_steps, opts.guidance_scale,
+        log.info("[qwen-image] edit {d}x{d} refs={d} steps={d} guidance={d:.1} refres={d} ({s})\n", .{
+            out_w,                      out_h,  image_bytes.len, n_steps, opts.guidance_scale, opts.ref_resolution,
             if (opts.guidance_scale != 1.0) "two forwards per step" else "one forward per step",
         });
         if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
@@ -2301,7 +2306,7 @@ pub const Engine = struct {
             var sh: c_int = 0;
             var ch: c_int = 0;
             if (stb.stbi_info_from_memory(bytes.ptr, @intCast(bytes.len), &sw, &sh, &ch) == 0) return error.ImageDecodeFailed;
-            const tgt = refResizeDims(@intCast(sw), @intCast(sh));
+            const tgt = refResizeDimsAt(@intCast(sw), @intCast(sh), opts.ref_resolution);
             var e_owned = true;
             var e = try qwen_image_edit.prepareEditImage(a, s, bytes, tgt.w, tgt.h);
             errdefer if (e_owned) e.deinit();
@@ -2592,6 +2597,21 @@ test "QwenImage editTargetSize: source aspect at output_resolution squared, roun
         try testing.expectEqual(c.w, got.w);
         try testing.expectEqual(c.h, got.h);
     }
+}
+
+test "QwenImage refResizeDimsAt: ref resolution is the per-request knob" {
+    // (1184, 896) is the pinned 1024-regime reference for a 4:3 source; the
+    // same source at 512² conditioning halves the joint tokens per ref.
+    const d = refResizeDimsAt(512, 384, 1024);
+    try testing.expectEqual(@as(u32, 1184), d.w);
+    try testing.expectEqual(@as(u32, 896), d.h);
+    const e = refResizeDimsAt(512, 384, 512);
+    try testing.expectEqual(@as(u32, 576), e.w);
+    try testing.expectEqual(@as(u32, 448), e.h);
+    // Degenerate aspect still snaps to the /32 grid both sides.
+    const f = refResizeDimsAt(100, 3000, 512);
+    try testing.expectEqual(@as(u32, 96), f.w);
+    try testing.expectEqual(@as(u32, 2784), f.h);
 }
 
 /// safetensors-shaped bytes: u64 LE header length + JSON + a small data pad.

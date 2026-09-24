@@ -156,7 +156,7 @@ done
 [ "$(gen "$OUT/e1.json" "\"prompt\":\"add a small red hat to the subject\",\"mode\":\"edit\",\"strength\":0.5,\"image\":\"$(cat "$OUT/src43.b64")\"")" = 200 ] \
   && [ "$(png_dims "$OUT/e1.json")" = "512x512" ] \
   && pass "instruction edit -> 512x512 PNG (valid strength accepted+ignored)" || fail "instruction edit"
-grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=1.0 (one forward per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "edit engaged (one forward per step)" || fail "no edit engagement line"
 grep -q "\[image\] edit: reference .* bytes (byte-based backend)" "$LOG" \
   && pass "byte-based edit transport engaged" || fail "no byte-based edit reference line"
@@ -175,7 +175,7 @@ grep -q "edit: target 1024x1024 -> 1184x896 (last reference is 512x384, size mat
 [ "$(genq "$OUT/e3.json" "\"prompt\":\"compose the subject and the two references into one image\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_images\":[\"$(cat "$OUT/ref256.b64")\",\"$(cat "$OUT/refp.b64")\"]")" = 200 ] \
   && [ "$(png_dims "$OUT/e3.json")" = "896x1184" ] \
   && pass "multi-ref edit -> 896x1184 (LAST reference's aspect)" || fail "multi-ref edit"
-grep -q "\[qwen-image\] edit 896x1184 refs=3 steps=6 guidance=1.0 (one forward per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 896x1184 refs=3 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "multi-ref edit engaged (refs=3)" || fail "no multi-ref engagement line"
 grep -q "\[image\] edit ref 3: .* bytes (byte-based backend)" "$LOG" \
   && pass "second extra reference engaged (edit ref 3)" || fail "no edit ref 3 line"
@@ -192,7 +192,20 @@ code="$(curl -s -m 3600 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conte
   -o "$OUT/e4b.json" -w '%{http_code}')"
 [ "$code" = 200 ] && [ "$(png_dims "$OUT/e4b.json")" = "256x256" ] \
   && pass "5-reference edit -> 256x256 PNG" || fail "5-ref edit returned $code"
-grep -q "\[qwen-image\] edit 256x256 refs=5 steps=6 guidance=1.0 (one forward per step)" "$LOG" \
+
+# ── ref_resolution: the per-request conditioning knob (diffusers'
+#    output_resolution). 512 engages; out of range is a named 400.
+code="$(curl -s -m 3600 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$ID\",\"size\":\"256x256\",\"steps\":6,\"seed\":3,\"prompt\":\"add a red hat\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_resolution\":512}" \
+  -o "$OUT/e9.json" -w '%{http_code}')"
+[ "$code" = 200 ] && [ "$(png_dims "$OUT/e9.json")" = "256x256" ] && grep -q "refres=512" "$LOG" \
+  && pass "ref_resolution 512 edit -> PNG, engagement logged" || fail "ref_resolution 512 edit returned $code"
+code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$ID\",\"size\":\"256x256\",\"steps\":6,\"seed\":3,\"prompt\":\"add a red hat\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_resolution\":1536}" \
+  -o "$OUT/e10.json" -w '%{http_code}')"
+[ "$code" = 400 ] && grep -q "ref_resolution.*\[256,1024\]" "$OUT/e10.json" \
+  && pass "ref_resolution 1536 -> 400 (named range)" || fail "ref_resolution out-of-range returned $code"
+grep -q "\[qwen-image\] edit 256x256 refs=5 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "5-ref edit engaged (refs=5)" || fail "no 5-ref engagement line"
 
 # ── edit CFG: guidance 2.5 + negative prompt runs TWO forwards per step and
@@ -201,7 +214,7 @@ grep -q "\[qwen-image\] edit 256x256 refs=5 steps=6 guidance=1.0 (one forward pe
 [ "$(gen "$OUT/e5.json" "\"prompt\":\"add a small red hat to the subject\",\"mode\":\"edit\",\"guidance_scale\":2.5,\"negative_prompt\":\"blurry, low quality\",\"image\":\"$(cat "$OUT/src43.b64")\"")" = 200 ] \
   && [ "$(png_dims "$OUT/e5.json")" = "512x512" ] \
   && pass "guided edit -> PNG" || fail "guided edit"
-grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=2.5 (two forwards per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=2.5 refres=1024 (two forwards per step)" "$LOG" \
   && pass "edit CFG engaged (two forwards per step)" || fail "edit CFG did not engage"
 cmp -s "$OUT/e1.json" "$OUT/e5.json" && fail "edit guidance did not change the render" || pass "edit guidance changes the render"
 
