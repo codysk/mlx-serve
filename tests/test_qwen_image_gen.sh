@@ -208,6 +208,15 @@ code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content
 grep -q "\[qwen-image\] edit 256x256 refs=5 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "5-ref edit engaged (refs=5)" || fail "no 5-ref engagement line"
 
+# ── the request-scope residency bill: a joint sequence past any working set
+#    refuses BY NAME (the #496 regime: high ref counts used to hang the first
+#    denoise step with no error). 10 refs + a 2048x2048 target bills >100 GB.
+code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$ID\",\"size\":\"2048x2048\",\"steps\":6,\"seed\":3,\"prompt\":\"compose\",\"mode\":\"edit\",\"image\":\"QQ==\",\"ref_images\":[\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\"]}" \
+  -o "$OUT/e11.json" -w '%{http_code}')"
+[ "$code" = 400 ] && grep -q "working set" "$OUT/e11.json" \
+  && pass "over-budget edit -> 400 named (bill vs headroom)" || fail "over-budget edit returned $code"
+
 # ── edit CFG: guidance 2.5 + negative prompt runs TWO forwards per step and
 # changes the render (same seed/steps/source/prompt as the happy path — only
 # the guidance differs)

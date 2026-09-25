@@ -201,20 +201,13 @@ fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
 /// True when `model_dir`'s model_index.json names the 2.1 pipeline. The 2.0
 /// family spells "QwenImagePipeline" — a different architecture we do not
 /// serve. Mirrors `model_discovery.peekQwenImage21Index` (kept in sync).
+/// True when `model_dir` is an mlx-community-style Qwen-Image-2.1 repo.
+/// Thin path→Dir wrapper over `model_discovery.peekQwenImage21Index` — the
+/// ONE predicate, so discovery and load can't disagree about a spelling.
 fn isQwenImage21Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekQwenImage21Index(io, allocator, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -1617,6 +1610,7 @@ pub const EditFormError = error{
     MultipleChoicesUnsupported,
     UrlResponseUnsupported,
     OutputFormatUnsupported,
+    MalformedNumber,
     StreamUnsupported,
     OutOfMemory,
 };
@@ -1634,6 +1628,7 @@ pub fn editFormErrorMessage(err: EditFormError) []const u8 {
         error.UrlResponseUnsupported => "'response_format' must be 'b64_json' — this server does not host generated files",
         error.OutputFormatUnsupported => "'output_format' must be 'png' — this server always returns PNG",
         error.StreamUnsupported => "'stream' is not supported on /v1/images/edits (use /v1/images/generations for SSE progress)",
+        error.MalformedNumber => "'steps'/'seed'/'guidance_scale'/'ref_resolution' must be a JSON number (they are spliced into the request body verbatim)",
         error.OutOfMemory => "out of memory",
     };
 }
@@ -1761,20 +1756,25 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
         try out.appendSlice(allocator, "]");
     }
     if (ref_resolution) |rr| {
+        if (!chat_mod.isJsonNumber(rr)) return error.MalformedNumber;
         try out.appendSlice(allocator, ",\"ref_resolution\":");
         try out.appendSlice(allocator, rr);
     }
-    // Sampling knobs: raw text through — the JSON handler's own range
-    // checks are the named 400s; a malformed value fails its body parse.
+    // Sampling knobs: each numeric value is validated as JSON grammar before
+    // splicing — a value like `8,"stream":true` must die HERE as a named 400,
+    // not smuggle extra fields into the body the JSON handler would honor.
     if (steps) |v| {
+        if (!chat_mod.isJsonNumber(v)) return error.MalformedNumber;
         try out.appendSlice(allocator, ",\"steps\":");
         try out.appendSlice(allocator, v);
     }
     if (seed) |v| {
+        if (!chat_mod.isJsonNumber(v)) return error.MalformedNumber;
         try out.appendSlice(allocator, ",\"seed\":");
         try out.appendSlice(allocator, v);
     }
     if (guidance_scale) |v| {
+        if (!chat_mod.isJsonNumber(v)) return error.MalformedNumber;
         try out.appendSlice(allocator, ",\"guidance_scale\":");
         try out.appendSlice(allocator, v);
     }
@@ -2397,6 +2397,28 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .negative_prompt = negative_prompt,
         .ref_resolution = ref_resolution,
     };
+
+    // Qwen-Image edit: the pack's residency bill reserved a flat transient;
+    // a request with many references (or a big target) needs more than that,
+    // and running past the working set hangs the first denoise step with no
+    // error — refuse by NAME with the number we compared.
+    if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
+        const bill = qwenImageEditTransientBytes(
+            @intCast(gen_opts.edit_image_bytes.len), gen_opts.ref_resolution, width, height,
+        );
+        if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
+            var active: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+            const need: u64 = bill - QWEN_IMAGE_EDIT_TRANSIENT_BYTES;
+            if (need > headroom) {
+                log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
+                    gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, need >> 20, headroom >> 20,
+                });
+                return sendError(conn, 400, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
+            }
+        }
+    }
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
         // saying "generation failed" would be a lie about a job we stopped.
@@ -4238,6 +4260,25 @@ const QWEN_IMAGE_EDIT_TRANSIENT_BYTES: u64 = 6 << 30;
 /// must not let the stage max() absorb it.
 const QWEN_IMAGE_EDIT_ENCODE_WS_BYTES: u64 = 2 << 30;
 
+/// The REQUEST-scope edit transient: what a specific edit's joint denoise
+/// allocates on top of the pack's flat reserve. The dominant term is the
+/// widest attention's f32 scores buffer (heads x q x joint kv) — the
+/// allocation that, run past the working set, hangs the first denoise step
+/// with no error (ddalcu/mlx-serve#496: 7 references). Persistent per-ref
+/// buffers were measured at ~65 MB per 1024-conditioning reference.
+const QWEN_IMAGE_EDIT_TEXT_TOKENS: u64 = 2600; // ti2i prompt budget upper bound
+const QWEN_IMAGE_EDIT_HEADS: u64 = 32; // the checkpoint's num_attention_heads
+
+pub fn qwenImageEditTransientBytes(refs: u32, ref_resolution: u32, out_w: u32, out_h: u32) u64 {
+    const rt: u64 = @as(u64, ref_resolution / 16) * (ref_resolution / 16);
+    const ot: u64 = @as(u64, out_w / 16) * (out_h / 16);
+    const joint: u64 = @as(u64, refs) * rt + ot + QWEN_IMAGE_EDIT_TEXT_TOKENS;
+    const widest_q: u64 = @max(ot, rt);
+    const scores: u64 = QWEN_IMAGE_EDIT_HEADS * widest_q * joint * 4;
+    const persistent: u64 = @as(u64, refs) * rt * (65 << 20) / 4096;
+    return scores + persistent;
+}
+
 /// The edit-capable pack's bill: the SAME staging answer as t2i (the engine
 /// and the residency bill read one `qwenImageStagesTextEncoder`), with the
 /// heavier edit transient whenever the tower is present.
@@ -5003,6 +5044,11 @@ test "openaiEditFormToJson: everything we can't honor is an explicit error" {
         .{ "Content-Disposition: form-data; name=\"response_format\"\r\n\r\nurl", EditFormError.UrlResponseUnsupported },
         .{ "Content-Disposition: form-data; name=\"output_format\"\r\n\r\njpeg", EditFormError.OutputFormatUnsupported },
         .{ "Content-Disposition: form-data; name=\"stream\"\r\n\r\ntrue", EditFormError.StreamUnsupported },
+        // Numeric fields are spliced into the rebuilt JSON body: a value like
+        // `8,"stream":true` would otherwise sail past this surface's own
+        // named 400s inside the handler (the review's exact injection).
+        .{ "Content-Disposition: form-data; name=\"steps\"\r\n\r\n8,\"stream\":true", EditFormError.MalformedNumber },
+        .{ "Content-Disposition: form-data; name=\"ref_resolution\"\r\n\r\nNaN", EditFormError.MalformedNumber },
     };
     inline for (cases) |c| {
         const form = base ++ "--X\r\n" ++ c[0] ++ "\r\n--X--\r\n";
@@ -5845,6 +5891,26 @@ test "Qwen-Image edit residency: the tower pack's heavier transient on the same 
     // biggest stage, where t2i's 4 GiB never was.
     try testing.expectEqual(10 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, true));
     try testing.expectEqual(8 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, false));
+}
+
+test "Qwen-Image edit transient: the request-scope bill scales with refs x ref tokens" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // One reference at 1024 sits inside the pack's flat reserve — the
+    // common case never sees the request gate.
+    const one = qwenImageEditTransientBytes(1, 1024, 256, 256);
+    try testing.expect(one < QWEN_IMAGE_EDIT_TRANSIENT_BYTES);
+    // The 5-reference live arm's shape: past the reserve (the marginal must
+    // clear live headroom) but well inside a 46 GB box.
+    const five = qwenImageEditTransientBytes(5, 1024, 256, 256);
+    try testing.expect(five > QWEN_IMAGE_EDIT_TRANSIENT_BYTES);
+    try testing.expect(five < 20 * GB);
+    // The hang regime (ddalcu/mlx-serve#496): 10 references plus a 2048x2048
+    // target is past ANY working set — the gate must refuse it by name.
+    const ten = qwenImageEditTransientBytes(10, 1024, 2048, 2048);
+    try testing.expect(ten > 100 * GB);
+    // ref_resolution halves the joint: the scores term shrinks with it.
+    const half = qwenImageEditTransientBytes(10, 512, 2048, 2048);
+    try testing.expect(half * 2 < ten);
 }
 
 test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
