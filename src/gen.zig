@@ -198,9 +198,6 @@ fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
     return discovery.peekLayaCheckpoint(io, dir);
 }
 
-/// True when `model_dir`'s model_index.json names the 2.1 pipeline. The 2.0
-/// family spells "QwenImagePipeline" — a different architecture we do not
-/// serve. Mirrors `model_discovery.peekQwenImage21Index` (kept in sync).
 /// True when `model_dir` is an mlx-community-style Qwen-Image-2.1 repo.
 /// Thin path→Dir wrapper over `model_discovery.peekQwenImage21Index` — the
 /// ONE predicate, so discovery and load can't disagree about a spelling.
